@@ -45,35 +45,76 @@ async def fetch_product_price(product_id: int) -> float:
         return float(data["price"])
 
 @app.post("/orders", response_model=OrderOut)
-async def create_order(payload: OrderCreateIn, claims: dict = Depends(require_user), db: Session = Depends(get_db)):
+async def create_order(
+    payload: OrderCreateIn,
+    claims: dict = Depends(require_user),
+    db: Session = Depends(get_db),
+):
     user_id = int(claims["sub"])
     user_email = claims["email"]
 
     if not payload.items:
-        raise HTTPException(400, "Empty cart")
+        raise HTTPException(status_code=400, detail="Empty cart")
 
-    order = Order(user_id=user_id, user_email=user_email, status="CREATED", total=0)
-    db.add(order)
-    db.commit()
-    db.refresh(order)
+    # Normalize/merge duplicate items by product_id
+    merged: dict[int, int] = {}
+    for it in payload.items:
+        pid = int(it.product_id)
+        qty = int(it.qty)
+        if qty <= 0:
+            raise HTTPException(status_code=400, detail="Invalid qty")
+        merged[pid] = merged.get(pid, 0) + qty
+
+    # Fetch prices first (so we don't create DB records if product lookup fails)
+    prices: dict[int, float] = {}
+    try:
+        for pid in merged.keys():
+            prices[pid] = float(await fetch_product_price(pid))
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=503, detail="Product service timeout")
+    except httpx.RequestError:
+        raise HTTPException(status_code=503, detail="Product service unavailable")
+    # fetch_product_price may raise HTTPException(400/...) already — let it bubble up
 
     total = 0.0
-    items_out: list[OrderItemOut] = []
+    for pid, qty in merged.items():
+        total += prices[pid] * qty
 
-    for it in payload.items:
-        if it.qty <= 0:
-            raise HTTPException(400, "Invalid qty")
-        unit_price = await fetch_product_price(it.product_id)
-        total += unit_price * it.qty
-        oi = OrderItem(order_id=order.id, product_id=it.product_id, qty=it.qty, unit_price=unit_price)
-        db.add(oi)
-        items_out.append(OrderItemOut(product_id=it.product_id, qty=it.qty, unit_price=float(unit_price)))
+    try:
+        # Atomic transaction: either everything commits or nothing does
+        with db.begin():
+            order = Order(user_id=user_id, user_email=user_email, status="CREATED", total=total)
+            db.add(order)
+            db.flush()  # ensures order.id exists without committing
 
-    order.total = total
-    db.commit()
-    db.refresh(order)
+            items_out: list[OrderItemOut] = []
+            for pid, qty in merged.items():
+                unit_price = prices[pid]
+                db.add(
+                    OrderItem(
+                        order_id=order.id,
+                        product_id=pid,
+                        qty=qty,
+                        unit_price=unit_price,
+                    )
+                )
+                items_out.append(
+                    OrderItemOut(product_id=pid, qty=qty, unit_price=float(unit_price))
+                )
 
-    return OrderOut(id=order.id, status=order.status, total=float(order.total), items=items_out)
+        # refresh after commit
+        db.refresh(order)
+
+        return OrderOut(
+            id=order.id,
+            status=order.status,
+            total=float(order.total),
+            items=items_out,
+        )
+
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to create order")
 
 @app.get("/orders/{order_id}", response_model=OrderOut)
 def get_order(order_id: int, claims: dict = Depends(require_user), db: Session = Depends(get_db)):

@@ -5,13 +5,15 @@ set -eu
 : "${VITE_AUTH_URL:=}"
 : "${VITE_PRODUCT_URL:=}"
 : "${VITE_ORDER_URL:=}"
+: "${VITE_PAYMENT_URL:=}"
 
 # Generate runtime config JS served by nginx
 cat > /usr/share/nginx/html/env.js <<EOF
 window.__ENV__ = {
   VITE_AUTH_URL: "${VITE_AUTH_URL}",
   VITE_PRODUCT_URL: "${VITE_PRODUCT_URL}",
-  VITE_ORDER_URL: "${VITE_ORDER_URL}"
+  VITE_ORDER_URL: "${VITE_ORDER_URL}",
+  VITE_PAYMENT_URL: "${VITE_PAYMENT_URL}"
 };
 EOF
 

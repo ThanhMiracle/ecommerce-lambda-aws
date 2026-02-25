@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { productApi } from "../api";
 import toast from "react-hot-toast";
 import { ProductGridSkeleton } from "../components/Loaders";
@@ -21,16 +22,53 @@ function resolveImageUrl(imageUrl: string | null | undefined) {
   const base = productApi.defaults.baseURL;
 
   // If baseURL is missing, fall back to relative path (will hit frontend domain)
-  // This helps debugging and avoids returning "null".
   if (!base) return imageUrl;
 
   // Safe join (handles leading/trailing slashes correctly)
   return new URL(imageUrl, base.endsWith("/") ? base : base + "/").toString();
 }
 
+type CartItem = { product_id: number; qty: number };
+
+function readCart(): CartItem[] {
+  try {
+    const raw = localStorage.getItem("cart");
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((x: any) => ({ product_id: Number(x?.product_id), qty: Number(x?.qty) }))
+      .filter((x) => Number.isFinite(x.product_id) && Number.isFinite(x.qty) && x.qty > 0);
+  } catch {
+    return [];
+  }
+}
+
+function writeCart(items: CartItem[]) {
+  localStorage.setItem("cart", JSON.stringify(items));
+}
+
 export default function Home() {
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(true);
+  const [cartCount, setCartCount] = useState(0);
+
+  const refreshCartCount = () => {
+    const cart = readCart();
+    const count = cart.reduce((sum, it) => sum + it.qty, 0);
+    setCartCount(count);
+  };
+
+  useEffect(() => {
+    refreshCartCount();
+
+    // keep count in sync across tabs/windows
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === "cart") refreshCartCount();
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
 
   useEffect(() => {
     productApi
@@ -41,16 +79,19 @@ export default function Home() {
   }, []);
 
   const addToCart = (p: Product) => {
-    const cart = JSON.parse(localStorage.getItem("cart") || "[]");
-    cart.push({ product_id: p.id, qty: 1 });
-    localStorage.setItem("cart", JSON.stringify(cart));
+    const cart = readCart();
+    const idx = cart.findIndex((x) => x.product_id === p.id);
+    if (idx >= 0) cart[idx].qty += 1;
+    else cart.push({ product_id: p.id, qty: 1 });
+    writeCart(cart);
+    refreshCartCount();
     toast.success(`Added "${p.name}" 🍬`);
   };
 
   return (
     <div className="space-y-6">
       <section className="candy-card p-6">
-        <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+        <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
           <div>
             <h1 className="text-3xl font-extrabold tracking-tight">
               Pick your{" "}
@@ -63,7 +104,19 @@ export default function Home() {
               Shiny products, fast checkout, email confirmations.
             </p>
           </div>
-          <div className="flex gap-2">
+
+          {/* Quick navigation buttons */}
+          <div className="flex flex-wrap gap-2">
+            <Link to="/cart">
+              <button className="candy-btn-outline">
+                Go to Cart 🛒 {cartCount > 0 ? `(${cartCount})` : ""}
+              </button>
+            </Link>
+
+            <Link to="/payments">
+              <button className="candy-btn-outline">Payment History 💳</button>
+            </Link>
+
             <span className="rounded-full bg-pink-100 px-3 py-1 text-xs font-semibold text-pink-700">New</span>
             <span className="rounded-full bg-sky-100 px-3 py-1 text-xs font-semibold text-sky-700">Popular</span>
             <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-semibold text-emerald-700">Verified</span>
@@ -121,6 +174,12 @@ export default function Home() {
                 <button className="candy-btn mt-4 w-full" onClick={() => addToCart(p)}>
                   Add to cart
                 </button>
+
+                <Link to="/cart">
+                  <button className="candy-btn-outline mt-2 w-full">
+                    View Cart
+                  </button>
+                </Link>
 
                 <div className="pointer-events-none mt-4 flex justify-between text-xs text-slate-500 opacity-0 transition group-hover:opacity-100">
                   <span>✨ glossy</span>

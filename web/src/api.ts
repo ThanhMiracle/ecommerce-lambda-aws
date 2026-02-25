@@ -4,6 +4,7 @@ type RuntimeEnv = {
   VITE_AUTH_URL?: string;
   VITE_PRODUCT_URL?: string;
   VITE_ORDER_URL?: string;
+  VITE_PAYMENT_URL?: string;
 };
 
 function getRuntimeEnv(): RuntimeEnv {
@@ -53,8 +54,11 @@ function createApi(getBaseURL: () => string | undefined): AxiosInstance {
 const AUTH_FALLBACK = import.meta.env.VITE_AUTH_URL as string | undefined;
 const PRODUCT_FALLBACK = import.meta.env.VITE_PRODUCT_URL as string | undefined;
 const ORDER_FALLBACK = import.meta.env.VITE_ORDER_URL as string | undefined;
+const PAYMENT_FALLBACK = import.meta.env.VITE_PAYMENT_URL as string | undefined;
+
 
 // APIs
 export const authApi = createApi(() => resolveBaseUrl("VITE_AUTH_URL", AUTH_FALLBACK));
 export const productApi = createApi(() => resolveBaseUrl("VITE_PRODUCT_URL", PRODUCT_FALLBACK));
 export const orderApi = createApi(() => resolveBaseUrl("VITE_ORDER_URL", ORDER_FALLBACK));
+export const paymentApi = createApi(() => resolveBaseUrl("VITE_PAYMENT_URL", PAYMENT_FALLBACK));

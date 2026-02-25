@@ -161,3 +161,148 @@ If you want, I can tell you:
 * or how this maps cleanly to Kubernetes probes later
 
 Just say the word.
+
+
+# FIX DNS docker 
+That error is not your compose file — it’s your machine/container runtime **can’t complete TLS to Docker Hub** (`registry-1.docker.io`). Typical causes: flaky network, DNS, IPv6 path issues, corporate proxy, or Docker daemon DNS.
+
+Here are fixes that usually work (do in order).
+
+---
+
+## 1) Quick retry + increase client timeouts
+
+```bash
+export DOCKER_CLIENT_TIMEOUT=300
+export COMPOSE_HTTP_TIMEOUT=300
+docker compose -f docker-compose.yml pull
+docker compose -f docker-compose.yml up -d --build
+```
+
+---
+
+## 2) Check basic connectivity to Docker Hub
+
+```bash
+curl -I https://registry-1.docker.io/v2/
+```
+
+* If this also times out → it’s network/DNS/proxy issue on your host.
+
+---
+
+## 3) Fix Docker DNS (very common)
+
+Create/edit `/etc/docker/daemon.json`:
+
+```bash
+sudo mkdir -p /etc/docker
+sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
+{
+  "dns": ["1.1.1.1", "8.8.8.8"]
+}
+JSON
+```
+
+Restart Docker:
+
+```bash
+sudo systemctl restart docker
+```
+
+Then try:
+
+```bash
+docker compose pull
+```
+
+---
+
+## 4) Disable IPv6 for Docker (often fixes TLS handshake timeout)
+
+Edit `/etc/docker/daemon.json` to:
+
+```json
+{
+  "ipv6": false,
+  "dns": ["1.1.1.1", "8.8.8.8"]
+}
+```
+
+Restart Docker again:
+
+```bash
+sudo systemctl restart docker
+```
+
+---
+
+## 5) If you’re behind a proxy / VPN
+
+Docker daemon needs proxy config too.
+
+Check if you have proxy env vars:
+
+```bash
+env | grep -i proxy
+```
+
+If you do, you must configure Docker service proxy:
+
+```bash
+sudo systemctl edit docker
+```
+
+Add:
+
+```
+[Service]
+Environment="HTTP_PROXY=http://YOUR_PROXY:PORT"
+Environment="HTTPS_PROXY=http://YOUR_PROXY:PORT"
+Environment="NO_PROXY=localhost,127.0.0.1,.local,::1"
+```
+
+Then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+```
+
+---
+
+## 6) Workaround: pull with a mirror / different registry route
+
+Sometimes Docker Hub rate/route issues. If you have images hosted elsewhere (GHCR), switch.
+
+Or temporarily change network:
+
+```bash
+docker pull hello-world
+```
+
+If `hello-world` fails too → definitely connectivity to hub.
+
+---
+
+## 7) If you just want to start without pulling
+
+If you already have images locally, do:
+
+```bash
+docker compose up -d --build --pull never
+```
+
+(But yours is failing while pulling, so this only helps if images already exist.)
+
+---
+
+### Tell me these 3 outputs and I’ll point to the exact fix:
+
+```bash
+curl -I https://registry-1.docker.io/v2/
+docker info | sed -n '1,80p'
+cat /etc/docker/daemon.json 2>/dev/null || echo "no daemon.json"
+```
+
+Most likely fix is **Docker DNS** + restart.

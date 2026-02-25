@@ -57,10 +57,15 @@ app = FastAPI(title="product-service")
 if STORAGE_BACKEND == "local":
     app.mount("/static", StaticFiles(directory=str(UPLOAD_DIR)), name="static")
 
+FRONTEND_ORIGINS = os.getenv(
+    "FRONTEND_ORIGINS",
+    "http://localhost:3000"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=FRONTEND_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
