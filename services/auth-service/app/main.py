@@ -21,7 +21,9 @@ from shared.security import require_user
 # -------------------------------------------------------------------
 # Config
 # -------------------------------------------------------------------
-JWT_SECRET = os.environ["JWT_SECRET"]
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET is not set")
 ALGO = "HS256"
 
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
@@ -155,7 +157,11 @@ def register(data: RegisterIn, db: Session = Depends(get_db)):
     verify_url = f"{FRONTEND_BASE_URL}/verify?token={token}"
 
     # Backend-agnostic publish (RabbitMQ locally, SQS on AWS, etc.)
-    publish("user.registered", {"email": user.email, "verify_url": verify_url})
+    try:
+        publish("user.registered", {"email": user.email, "verify_url": verify_url})
+    except Exception as e:
+    # Don't fail registration if the event backend is temporarily unavailable
+        print("event publish failed:", repr(e))
 
     return {"ok": True, "message": "Registered. Please verify your email."}
 

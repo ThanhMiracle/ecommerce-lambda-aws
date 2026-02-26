@@ -174,10 +174,13 @@ def pay_order(order_id: int, claims: dict = Depends(require_user), db: Session =
     db.refresh(order)
 
     # Backend-agnostic event publish (RabbitMQ locally, SQS on AWS, etc.)
-    publish(
+    try:
+        publish(
         "payment.succeeded",
-        {"email": order.user_email, "order_id": order.id, "total": float(order.total)},
-    )
+        {"email": order.user_email, "order_id": order.id, "total": float(order.total)},)
+    except Exception as e:
+    # Don't break payment if the event system is temporarily unavailable
+        print("event publish failed:", repr(e))
 
     return {"ok": True, "status": "PAID"}
 

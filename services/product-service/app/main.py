@@ -17,8 +17,8 @@ from .models import Product
 from .schemas import ProductOut, ProductCreate, ProductUpdate
 from shared.security import require_user, require_admin
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("product-service")
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 # =========================
 # Storage config
@@ -28,25 +28,33 @@ STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local").lower()  # local | s3
 # Local storage (dev only). In Lambda, use S3.
 UPLOAD_DIR: Path
 if STORAGE_BACKEND == "local":
-    if "UPLOAD_DIR" not in os.environ:
+    upload_dir_env = os.getenv("UPLOAD_DIR")
+    if not upload_dir_env:
         raise RuntimeError("UPLOAD_DIR must be set when STORAGE_BACKEND=local")
-    UPLOAD_DIR = Path(os.environ["UPLOAD_DIR"])
+    UPLOAD_DIR = Path(upload_dir_env)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 else:
     UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))  # not used in s3 mode
 
 S3_BUCKET = os.getenv("S3_BUCKET")
-AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
+AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-southeast-1"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
-s3 = None
+# Lazy-init S3 client (reuse across Lambda invocations)
+_s3 = None
 if STORAGE_BACKEND == "s3":
     if not S3_BUCKET:
         raise RuntimeError("Missing env var S3_BUCKET when STORAGE_BACKEND=s3")
-    s3 = boto3.client("s3", region_name=AWS_REGION)
 
 ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".webp"}
 ALLOWED_MIME = {"image/png", "image/jpeg", "image/webp"}
+
+
+def _get_s3():
+    global _s3
+    if _s3 is None:
+        _s3 = boto3.client("s3", region_name=AWS_REGION)
+    return _s3
 
 
 def get_db():
@@ -62,13 +70,15 @@ async def lifespan(app: FastAPI):
     # Keep Lambda cold start lightweight: no create_all/init_schema here.
     if STORAGE_BACKEND == "local":
         logger.info("Storage backend=local; UPLOAD_DIR=%s; serving at /static/*", str(UPLOAD_DIR))
-    else:
+    elif STORAGE_BACKEND == "s3":
         logger.info(
             "Storage backend=s3; bucket=%s region=%s public_base=%s",
             S3_BUCKET,
             AWS_REGION,
             PUBLIC_BASE_URL or "(none)",
         )
+    else:
+        logger.warning("Unknown STORAGE_BACKEND=%s (expected local|s3)", STORAGE_BACKEND)
     yield
 
 
@@ -96,10 +106,15 @@ def normalize_image_url(url: str | None) -> str | None:
     if not u:
         return None
 
+    # Absolute URLs are already good
     if u.startswith("http://") or u.startswith("https://"):
         return u
+
+    # Local static URLs
     if u.startswith("/static/"):
         return u
+
+    # Legacy/local-friendly rewrites
     if u.startswith("/prod_") or u.startswith("prod_"):
         filename = u.lstrip("/")
         return f"/static/{filename}"
@@ -165,7 +180,12 @@ def admin_create(payload: ProductCreate, claims: dict = Depends(require_user), d
 
 
 @app.patch("/admin/products/{product_id}", response_model=ProductOut)
-def admin_update(product_id: int, payload: ProductUpdate, claims: dict = Depends(require_user), db: Session = Depends(get_db)):
+def admin_update(
+    product_id: int,
+    payload: ProductUpdate,
+    claims: dict = Depends(require_user),
+    db: Session = Depends(get_db),
+):
     require_admin(claims)
     p = db.query(Product).filter(Product.id == product_id).first()
     if not p:
@@ -243,9 +263,10 @@ async def upload_product_image(
 
     # S3 MODE (AWS)
     if STORAGE_BACKEND == "s3":
-        if s3 is None:
-            raise HTTPException(500, "S3 client not initialized")
+        if not S3_BUCKET:
+            raise HTTPException(500, "S3_BUCKET not set")
 
+        s3 = _get_s3()
         out_name = f"{uuid.uuid4().hex}{ext}"
         key = f"products/{product_id}/{out_name}"
 

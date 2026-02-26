@@ -2,7 +2,9 @@ import os
 from fastapi import Header, HTTPException, Depends
 from jose import jwt, JWTError, ExpiredSignatureError
 
-JWT_SECRET = os.environ["JWT_SECRET"]
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET is not set")
 ALGO = "HS256"
 
 # Optional future-proofing

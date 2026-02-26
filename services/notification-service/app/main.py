@@ -1,171 +1,76 @@
-import json
+import os
+import smtplib
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from email.mime.text import MIMEText
+from typing import Optional
 
-from .emailer import send_email
-
-logger = logging.getLogger("notification-service")
-logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
-def handle_event(event_type: str, payload: Dict[str, Any]) -> None:
+def _get_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).lower() == "true"
+
+
+def send_email(to_email: str, subject: str, html_body: str) -> None:
     """
-    Handle domain events.
-    payload examples:
-      user.registered: { "email": "...", "verify_url": "..." }
-      payment.succeeded: { "email": "...", "order_id": "...", "total": ... }
+    Send email via SMTP.
+
+    Required env:
+      SMTP_HOST
+
+    Optional env:
+      SMTP_PORT (default 587)
+      SMTP_USER
+      SMTP_PASS
+      FROM_EMAIL
+      SMTP_USE_TLS (true/false)
+      SMTP_USE_SSL (true/false)
+      SMTP_USE_AUTH (true/false)
+      SMTP_TIMEOUT (seconds, default 10)
     """
-    if event_type == "user.registered":
-        email = payload["email"]
-        verify_url = payload["verify_url"]
 
-        send_email(
-            to_email=email,
-            subject="Verify your MicroShop account",
-            html_body=(
-                "<h3>Welcome to MicroShop</h3>"
-                "<p>Please verify your email:</p>"
-                f"<p><a href='{verify_url}'>{verify_url}</a></p>"
-            ),
-        )
-        logger.info("Sent verification email to %s", email)
-        return
+    smtp_host = os.getenv("SMTP_HOST")
+    if not smtp_host:
+        raise RuntimeError("SMTP_HOST is not set")
 
-    if event_type == "payment.succeeded":
-        email = payload["email"]
-        order_id = payload["order_id"]
-        total = payload["total"]
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER", "")
+    smtp_pass = os.getenv("SMTP_PASS", "")
+    from_email = os.getenv("FROM_EMAIL") or smtp_user or "noreply@local"
 
-        send_email(
-            to_email=email,
-            subject="Payment confirmed - MicroShop",
-            html_body=(
-                "<h3>Payment successful</h3>"
-                f"<p>Order <b>#{order_id}</b> is paid.</p>"
-                f"<p>Total: <b>${total}</b></p>"
-            ),
-        )
-        logger.info("Sent payment email to %s (order #%s)", email, order_id)
-        return
+    use_tls = _get_bool("SMTP_USE_TLS")
+    use_ssl = _get_bool("SMTP_USE_SSL")
+    use_auth = _get_bool("SMTP_USE_AUTH")
+    timeout = float(os.getenv("SMTP_TIMEOUT", "10"))
 
-    logger.info("Ignoring event_type=%s payload=%s", event_type, payload)
+    msg = MIMEText(html_body, "html", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = to_email
 
-
-def _try_parse_json(s: Any) -> Optional[Dict[str, Any]]:
-    if isinstance(s, dict):
-        return s
-    if not isinstance(s, str):
-        return None
-    s = s.strip()
-    if not s:
-        return None
     try:
-        obj = json.loads(s)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
+        if use_ssl:
+            server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=timeout)
+        else:
+            server = smtplib.SMTP(smtp_host, smtp_port, timeout=timeout)
 
+        with server as s:
+            s.ehlo()
 
-def _extract_sqs_records(event: Dict[str, Any]) -> List[Dict[str, Any]]:
-    records = event.get("Records")
-    return records if isinstance(records, list) else []
+            if use_tls and not use_ssl:
+                s.starttls()
+                s.ehlo()
 
+            if use_auth:
+                if not smtp_user or not smtp_pass:
+                    raise RuntimeError("SMTP_USE_AUTH=true but SMTP_USER/SMTP_PASS not set")
+                s.login(smtp_user, smtp_pass)
 
-def _parse_message(obj: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """
-    Expected message format:
-      { "type": "user.registered", "payload": {...} }
-    """
-    event_type = obj.get("type") or obj.get("event_type")
-    payload = obj.get("payload") or {}
-    if not isinstance(event_type, str) or not isinstance(payload, dict):
-        return None
-    return event_type, payload
+            s.sendmail(from_email, [to_email], msg.as_string())
 
+        logger.info("Email sent to=%s subject=%s", to_email, subject)
 
-def _handle_sqs_batch(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    If this is an SQS trigger, we MUST return the partial batch response shape:
-      { "batchItemFailures": [ {"itemIdentifier": "<messageId>"} , ...] }
-
-    This ensures only failed messages are retried (instead of the whole batch).
-    """
-    records = _extract_sqs_records(event)
-    if not records:
-        return None
-
-    failures: List[Dict[str, str]] = []
-    processed = 0
-
-    for r in records:
-        message_id = r.get("messageId") or r.get("messageID") or r.get("message_id") or ""
-        body = r.get("body")
-        obj = _try_parse_json(body)
-
-        if not obj:
-            logger.warning("Skipping non-JSON SQS body: %s", body)
-            # treat as failure so it can go to DLQ after retries
-            if message_id:
-                failures.append({"itemIdentifier": message_id})
-            continue
-
-        parsed = _parse_message(obj)
-        if not parsed:
-            logger.warning("Bad message format: %s", obj)
-            if message_id:
-                failures.append({"itemIdentifier": message_id})
-            continue
-
-        event_type, payload = parsed
-
-        try:
-            handle_event(event_type, payload)
-            processed += 1
-        except Exception as e:
-            logger.exception("Failed processing message_id=%s error=%s", message_id, repr(e))
-            if message_id:
-                failures.append({"itemIdentifier": message_id})
-
-    logger.info("SQS batch processed=%s failures=%s", processed, len(failures))
-    return {"batchItemFailures": failures}
-
-
-def _extract_eventbridge(event: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """
-    EventBridge style:
-      {
-        "detail-type": "user.registered",
-        "detail": {...}
-      }
-    """
-    detail_type = event.get("detail-type") or event.get("detailType")
-    detail = event.get("detail")
-    if isinstance(detail_type, str) and isinstance(detail, dict):
-        return detail_type, detail
-    return None
-
-
-def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    logger.info("Received event keys: %s", list(event.keys()) if isinstance(event, dict) else type(event))
-
-    # 1) SQS (recommended)
-    sqs_resp = _handle_sqs_batch(event)
-    if sqs_resp is not None:
-        return sqs_resp
-
-    # 2) EventBridge direct
-    eb = _extract_eventbridge(event)
-    if eb:
-        event_type, payload = eb
-        handle_event(event_type, payload)
-        return {"ok": True, "source": "eventbridge"}
-
-    # 3) Direct invoke (testing)
-    direct = _parse_message(event) if isinstance(event, dict) else None
-    if direct:
-        event_type, payload = direct
-        handle_event(event_type, payload)
-        return {"ok": True, "source": "direct"}
-
-    logger.warning("Unsupported event format: %s", event)
-    return {"ok": False, "error": "Unsupported event format"}
+    except Exception as e:
+        logger.exception("Email send failed to=%s error=%s", to_email, repr(e))
+        raise
