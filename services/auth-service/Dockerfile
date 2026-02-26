@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.6
 
 ############################
-# 1) Builder Stage (no apt)
+# 1) Builder Stage (wheels)
 ############################
 FROM python:3.11-slim AS builder
 
@@ -11,9 +11,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /build
 
+# Copy requirements first for cache efficiency
 COPY auth-service/requirements.txt ./requirements.txt
 
-# Build wheels from binaries when available (avoids needing gcc)
 RUN --mount=type=cache,target=/root/.cache/pip \
     set -eux; \
     pip install --upgrade pip setuptools wheel; \
@@ -21,36 +21,31 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 
 ############################
-# 2) Runtime Stage
+# 2) Lambda Runtime Stage
 ############################
-FROM python:3.11-slim AS runtime
+FROM public.ecr.aws/lambda/python:3.11 AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/var/task
 
-WORKDIR /app
+WORKDIR /var/task
 
-RUN useradd -m -u 10001 appuser
-
+# Install deps from wheels
 COPY --from=builder /wheels /wheels
 COPY auth-service/requirements.txt ./requirements.txt
 
 RUN set -eux; \
     pip install --no-index --find-links=/wheels -r ./requirements.txt; \
-    rm -rf /wheels
+    rm -rf /wheels /root/.cache/pip
 
+# Copy app code
 COPY auth-service/app ./app
+
+# Copy shared module (inside services/)
 COPY shared ./shared
 
-RUN chown -R appuser:appuser /app
-USER appuser
-
-EXPOSE 8000
-
-HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()" || exit 1
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Lambda handler
+CMD ["app.lambda_handler.handler"]

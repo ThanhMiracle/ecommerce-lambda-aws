@@ -1,9 +1,10 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class PaymentCreateIn(BaseModel):
-    shipping_address: str
-    phone_number: str
+    shipping_address: str = Field(min_length=1)
+    phone_number: str = Field(min_length=3)
+
 
 class PaymentCreateOut(BaseModel):
     ok: bool
@@ -17,5 +18,4 @@ class PaymentOut(BaseModel):
     amount: float
     status: str
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

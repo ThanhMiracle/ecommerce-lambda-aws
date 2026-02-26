@@ -2,6 +2,7 @@ import os
 import time
 import hashlib
 import base64
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +10,7 @@ from jose import jwt
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
-from .db import Base, engine, SessionLocal, init_schema, set_search_path
+from .db import SessionLocal
 from .models import User
 from .schemas import RegisterIn, LoginIn, TokenOut, MeOut
 from .email_tokens import make_verify_token, decode_verify_token
@@ -23,19 +24,14 @@ from shared.security import require_user
 JWT_SECRET = os.environ["JWT_SECRET"]
 ALGO = "HS256"
 
-# IMPORTANT: Set this to http://localhost:3000 in docker-compose for nginx web
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
-RABBITMQ_URL = os.getenv("RABBITMQ_URL", "")
 
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# Hard limit just to prevent abuse (not bcrypt-related)
 MAX_PASSWORD_BYTES = 4096
-
-# Access token lifetime (seconds)
 ACCESS_TOKEN_TTL = int(os.getenv("ACCESS_TOKEN_TTL", str(60 * 60 * 24)))  # 24h
 
 
@@ -55,10 +51,6 @@ def _validate_password(pw: str) -> None:
 
 
 def _normalize_password(pw: str) -> str:
-    """
-    Pre-hash password using SHA-256 → base64
-    Output is always 44 ASCII chars (safe for bcrypt).
-    """
     digest = hashlib.sha256(pw.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest).decode("ascii")
 
@@ -74,19 +66,8 @@ def verify_password(pw: str, pw_hash: str) -> bool:
 
 
 # -------------------------------------------------------------------
-# App
+# DB dependency
 # -------------------------------------------------------------------
-app = FastAPI(title="auth-service")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten in prod
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 def get_db():
     db = SessionLocal()
     try:
@@ -121,14 +102,34 @@ def seed_admin(db: Session):
     db.commit()
 
 
-@app.on_event("startup")
-def startup():
-    init_schema()
-    set_search_path()
-    Base.metadata.create_all(bind=engine)
+# -------------------------------------------------------------------
+# Lifespan (Lambda-safe startup)
+# -------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Keep cold start lightweight.
+    # Run migrations/schema creation at deploy-time (CI/CD), not here.
+    try:
+        with SessionLocal() as db:
+            seed_admin(db)
+    except Exception as e:
+        # Don't crash app if DB is temporarily unreachable at cold start.
+        print("Startup DB step skipped:", repr(e))
+    yield
 
-    with SessionLocal() as db:
-        seed_admin(db)
+
+# -------------------------------------------------------------------
+# App
+# -------------------------------------------------------------------
+app = FastAPI(title="auth-service", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten in prod
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # -------------------------------------------------------------------
@@ -151,17 +152,10 @@ def register(data: RegisterIn, db: Session = Depends(get_db)):
     db.refresh(user)
 
     token = make_verify_token(user.id, user.email)
-
-    # Frontend route receives token, then frontend should call backend /auth/verify
     verify_url = f"{FRONTEND_BASE_URL}/verify?token={token}"
 
-    # Publish event for notify-service (Mailhog)
-    if RABBITMQ_URL:
-        publish(
-            RABBITMQ_URL,
-            "user.registered",
-            {"email": user.email, "verify_url": verify_url},
-        )
+    # Backend-agnostic publish (RabbitMQ locally, SQS on AWS, etc.)
+    publish("user.registered", {"email": user.email, "verify_url": verify_url})
 
     return {"ok": True, "message": "Registered. Please verify your email."}
 
@@ -238,6 +232,7 @@ def me(claims: dict = Depends(require_user), db: Session = Depends(get_db)):
         is_admin=user.is_admin,
         is_verified=user.is_verified,
     )
+
 
 @app.get("/health")
 def health():

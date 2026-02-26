@@ -2,6 +2,7 @@ from pathlib import Path
 import uuid
 import os
 import logging
+from contextlib import asynccontextmanager
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -11,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
-from .db import Base, engine, SessionLocal, init_schema
+from .db import SessionLocal
 from .models import Product
 from .schemas import ProductOut, ProductCreate, ProductUpdate
 from shared.security import require_user, require_admin
@@ -24,51 +25,28 @@ logger = logging.getLogger("product-service")
 # =========================
 STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local").lower()  # local | s3
 
-# Local storage (explicit contract)
-# - When STORAGE_BACKEND=local: UPLOAD_DIR must be set and must be a writable path (typically a mounted volume)
-# - When STORAGE_BACKEND=s3: UPLOAD_DIR is not required (uploads go to S3)
+# Local storage (dev only). In Lambda, use S3.
+UPLOAD_DIR: Path
 if STORAGE_BACKEND == "local":
     if "UPLOAD_DIR" not in os.environ:
-        raise RuntimeError("UPLOAD_DIR environment variable must be set when STORAGE_BACKEND=local")
+        raise RuntimeError("UPLOAD_DIR must be set when STORAGE_BACKEND=local")
     UPLOAD_DIR = Path(os.environ["UPLOAD_DIR"])
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 else:
-    # still define it for type/clarity; not used in s3 mode
-    UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
+    UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))  # not used in s3 mode
 
-# S3 storage (only required when STORAGE_BACKEND=s3)
 S3_BUCKET = os.getenv("S3_BUCKET")
 AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # e.g. https://dxxxxx.cloudfront.net
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 s3 = None
 if STORAGE_BACKEND == "s3":
     if not S3_BUCKET:
-        raise RuntimeError("Missing required env var: S3_BUCKET (when STORAGE_BACKEND=s3)")
+        raise RuntimeError("Missing env var S3_BUCKET when STORAGE_BACKEND=s3")
     s3 = boto3.client("s3", region_name=AWS_REGION)
 
 ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".webp"}
 ALLOWED_MIME = {"image/png", "image/jpeg", "image/webp"}
-
-app = FastAPI(title="product-service")
-
-# Serve uploaded images only in LOCAL mode
-# NOTE: This mounts /static/* -> files from UPLOAD_DIR (filesystem)
-if STORAGE_BACKEND == "local":
-    app.mount("/static", StaticFiles(directory=str(UPLOAD_DIR)), name="static")
-
-FRONTEND_ORIGINS = os.getenv(
-    "FRONTEND_ORIGINS",
-    "http://localhost:3000"
-).split(",")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=FRONTEND_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 def get_db():
@@ -79,51 +57,56 @@ def get_db():
         db.close()
 
 
-@app.on_event("startup")
-def startup():
-    init_schema()
-    Base.metadata.create_all(bind=engine)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Keep Lambda cold start lightweight: no create_all/init_schema here.
     if STORAGE_BACKEND == "local":
         logger.info("Storage backend=local; UPLOAD_DIR=%s; serving at /static/*", str(UPLOAD_DIR))
     else:
-        logger.info("Storage backend=s3; bucket=%s region=%s public_base=%s", S3_BUCKET, AWS_REGION, PUBLIC_BASE_URL or "(none)")
+        logger.info(
+            "Storage backend=s3; bucket=%s region=%s public_base=%s",
+            S3_BUCKET,
+            AWS_REGION,
+            PUBLIC_BASE_URL or "(none)",
+        )
+    yield
 
 
-# -------------------------
-# Helpers
-# -------------------------
+app = FastAPI(title="product-service", lifespan=lifespan)
+
+# Serve uploaded images only in LOCAL mode (dev)
+if STORAGE_BACKEND == "local":
+    app.mount("/static", StaticFiles(directory=str(UPLOAD_DIR)), name="static")
+
+FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in FRONTEND_ORIGINS if o.strip()],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 def normalize_image_url(url: str | None) -> str | None:
-    """
-    Backward compatible fixes for old DB values.
-    - Local mode: serve files under /static (mounted to UPLOAD_DIR)
-    - S3 mode: keep absolute URLs
-    """
     if not url:
         return None
-
     u = url.strip()
     if not u:
         return None
 
-    # Absolute URL (S3/CloudFront) - keep as-is
     if u.startswith("http://") or u.startswith("https://"):
         return u
-
-    # Already correct for local
     if u.startswith("/static/"):
         return u
-
-    # Old/bad records: "/prod_1_xxx.jpg" or "prod_1_xxx.jpg"
     if u.startswith("/prod_") or u.startswith("prod_"):
         filename = u.lstrip("/")
         return f"/static/{filename}"
-
-    # Sometimes people used "/uploads/..." or "uploads/..."
     if u.startswith("/uploads/"):
         return u.replace("/uploads/", "/static/", 1)
     if u.startswith("uploads/"):
-        return f"/static/{u[len('uploads/'):]}"  # drop uploads/
-
+        return f"/static/{u[len('uploads/'):]}"
     return u
 
 
@@ -237,13 +220,10 @@ async def upload_product_image(
     if ext not in ALLOWED_EXT:
         raise HTTPException(400, "Only .png, .jpg, .jpeg, .webp allowed")
 
-    # Optional MIME check
     if file.content_type and file.content_type not in ALLOWED_MIME:
         raise HTTPException(400, f"Unsupported content type: {file.content_type}")
 
-    # -------------------------
-    # LOCAL MODE
-    # -------------------------
+    # LOCAL MODE (dev only)
     if STORAGE_BACKEND == "local":
         out_name = f"prod_{product_id}_{uuid.uuid4().hex}{ext}"
         dest = UPLOAD_DIR / out_name
@@ -256,16 +236,16 @@ async def upload_product_image(
         finally:
             await file.close()
 
-        # Always store correct local URL
         p.image_url = f"/static/{out_name}"
         db.commit()
         db.refresh(p)
         return to_out(p)
 
-    # -------------------------
-    # S3 MODE
-    # -------------------------
+    # S3 MODE (AWS)
     if STORAGE_BACKEND == "s3":
+        if s3 is None:
+            raise HTTPException(500, "S3 client not initialized")
+
         out_name = f"{uuid.uuid4().hex}{ext}"
         key = f"products/{product_id}/{out_name}"
 
@@ -285,22 +265,10 @@ async def upload_product_image(
             except Exception:
                 pass
 
-        # Build public URL
         if PUBLIC_BASE_URL:
             image_url = f"{PUBLIC_BASE_URL}/{key}"
         else:
             image_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{key}"
-
-        # Optional: delete old image if it looks like our products prefix
-        old = (p.image_url or "").strip()
-        if old:
-            idx = old.find("/products/")
-            if idx != -1:
-                old_key = old[idx + 1 :]  # remove leading slash
-                try:
-                    s3.delete_object(Bucket=S3_BUCKET, Key=old_key)
-                except Exception:
-                    pass
 
         p.image_url = image_url
         db.commit()

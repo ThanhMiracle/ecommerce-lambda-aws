@@ -306,3 +306,8 @@ cat /etc/docker/daemon.json 2>/dev/null || echo "no daemon.json"
 ```
 
 Most likely fix is **Docker DNS** + restart.
+
+
+EMAIL_BACKEND=ses
+SES_REGION=ap-southeast-1   # or your region
+SES_FROM_EMAIL=verified-sender@your-domain.com

@@ -12,3 +12,5 @@ pydantic==2.9.2
 email-validator==2.2.0
 
 pika==1.3.2
+
+mangum==0.17.0
